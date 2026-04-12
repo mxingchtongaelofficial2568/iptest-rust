@@ -111,9 +111,7 @@ CSV 文件包含以下字段：
 - **免责条款**：本软件不提供任何担保，作者不承担使用风险。
 
 ## 致谢
-
-
 原始版本参考与致谢：
-- 原版本：[https://github.com/Kwisma/iptest](https://github.com/Kwisma/iptest)
+- Go原版本基于Kwisma项目：[https://github.com/Kwisma/iptest](https://github.com/Kwisma/iptest)
 - 代码基于[白嫖哥](https://github.com/XIU2)源码修改：[https://t.me/CF_NAT/38811](https://t.me/CF_NAT/38811)
 - `delay` 添加参考：[https://github.com/yutian81/IP-SpeedTest](https://github.com/yutian81/IP-SpeedTest)
