@@ -48,10 +48,6 @@ jobs:
             artifact_name: iptest-windows-amd64.exe
             binary_name: iptest.exe
             build_command: xwin
-          - target: aarch64-pc-windows-msvc
-            artifact_name: iptest-windows-arm64.exe
-            binary_name: iptest.exe
-            build_command: xwin
           - target: x86_64-apple-darwin
             artifact_name: iptest-darwin-amd64
             binary_name: iptest
@@ -123,19 +119,6 @@ jobs:
               echo "CXX_X86_64_PC_WINDOWS_MSVC=clang-cl" >> "$GITHUB_ENV"
               echo "AR_X86_64_PC_WINDOWS_MSVC=llvm-lib" >> "$GITHUB_ENV"
               ;;
-            aarch64-pc-windows-msvc)
-              echo "CC=clang-cl" >> "$GITHUB_ENV"
-              echo "CXX=clang-cl" >> "$GITHUB_ENV"
-              echo "AR=llvm-lib" >> "$GITHUB_ENV"
-              echo "CC_aarch64_pc_windows_msvc=clang-cl" >> "$GITHUB_ENV"
-              echo "CXX_aarch64_pc_windows_msvc=clang-cl" >> "$GITHUB_ENV"
-              echo "AR_aarch64_pc_windows_msvc=llvm-lib" >> "$GITHUB_ENV"
-              echo "CC_AARCH64_PC_WINDOWS_MSVC=clang-cl" >> "$GITHUB_ENV"
-              echo "CXX_AARCH64_PC_WINDOWS_MSVC=clang-cl" >> "$GITHUB_ENV"
-              echo "AR_AARCH64_PC_WINDOWS_MSVC=llvm-lib" >> "$GITHUB_ENV"
-              echo "CC_ENABLE_DEBUG_OUTPUT=1" >> "$GITHUB_ENV"
-              echo "RUST_BACKTRACE=full" >> "$GITHUB_ENV"
-              ;;
             x86_64-apple-darwin)
               echo "CARGO_TARGET_X86_64_APPLE_DARWIN_LINKER=o64-clang" >> "$GITHUB_ENV"
               echo "CC_x86_64_apple_darwin=o64-clang" >> "$GITHUB_ENV"
@@ -154,11 +137,7 @@ jobs:
           echo "Building ${{ matrix.artifact_name }} for ${{ matrix.target }}"
 
           if [ "${{ matrix.build_command }}" = "xwin" ]; then
-            if [ "${{ matrix.target }}" = "aarch64-pc-windows-msvc" ]; then
-              cargo xwin build -vv --release --locked --target "${{ matrix.target }}"
-            else
-              cargo xwin build --release --locked --target "${{ matrix.target }}"
-            fi
+            cargo xwin build --release --locked --target "${{ matrix.target }}"
           else
             cargo build --release --locked --target "${{ matrix.target }}"
           fi
@@ -213,7 +192,6 @@ jobs:
 
             已包含以下平台产物：
             - Windows amd64
-            - Windows arm64
             - Linux amd64
             - Linux arm64
             - macOS amd64
