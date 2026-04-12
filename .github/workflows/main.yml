@@ -152,7 +152,11 @@ jobs:
           echo "Building ${{ matrix.artifact_name }} for ${{ matrix.target }}"
 
           if [ "${{ matrix.build_command }}" = "xwin" ]; then
-            cargo xwin build --release --locked --target "${{ matrix.target }}"
+            if [ "${{ matrix.target }}" = "aarch64-pc-windows-msvc" ]; then
+              cargo xwin build -vv --release --locked --target "${{ matrix.target }}"
+            else
+              cargo xwin build --release --locked --target "${{ matrix.target }}"
+            fi
           else
             cargo build --release --locked --target "${{ matrix.target }}"
           fi
