@@ -113,14 +113,26 @@ jobs:
               echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc" >> "$GITHUB_ENV"
               ;;
             x86_64-pc-windows-msvc)
+              echo "CC=clang-cl" >> "$GITHUB_ENV"
+              echo "CXX=clang-cl" >> "$GITHUB_ENV"
+              echo "AR=llvm-lib" >> "$GITHUB_ENV"
               echo "CC_x86_64_pc_windows_msvc=clang-cl" >> "$GITHUB_ENV"
               echo "CXX_x86_64_pc_windows_msvc=clang-cl" >> "$GITHUB_ENV"
               echo "AR_x86_64_pc_windows_msvc=llvm-lib" >> "$GITHUB_ENV"
+              echo "CC_X86_64_PC_WINDOWS_MSVC=clang-cl" >> "$GITHUB_ENV"
+              echo "CXX_X86_64_PC_WINDOWS_MSVC=clang-cl" >> "$GITHUB_ENV"
+              echo "AR_X86_64_PC_WINDOWS_MSVC=llvm-lib" >> "$GITHUB_ENV"
               ;;
             aarch64-pc-windows-msvc)
+              echo "CC=clang-cl" >> "$GITHUB_ENV"
+              echo "CXX=clang-cl" >> "$GITHUB_ENV"
+              echo "AR=llvm-lib" >> "$GITHUB_ENV"
               echo "CC_aarch64_pc_windows_msvc=clang-cl" >> "$GITHUB_ENV"
               echo "CXX_aarch64_pc_windows_msvc=clang-cl" >> "$GITHUB_ENV"
               echo "AR_aarch64_pc_windows_msvc=llvm-lib" >> "$GITHUB_ENV"
+              echo "CC_AARCH64_PC_WINDOWS_MSVC=clang-cl" >> "$GITHUB_ENV"
+              echo "CXX_AARCH64_PC_WINDOWS_MSVC=clang-cl" >> "$GITHUB_ENV"
+              echo "AR_AARCH64_PC_WINDOWS_MSVC=llvm-lib" >> "$GITHUB_ENV"
               ;;
             x86_64-apple-darwin)
               echo "CARGO_TARGET_X86_64_APPLE_DARWIN_LINKER=o64-clang" >> "$GITHUB_ENV"
