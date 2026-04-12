@@ -1,4 +1,5 @@
-name: Build All Platforms
+name: Build Rust Releases
+
 on:
   workflow_dispatch:
     inputs:
@@ -9,164 +10,187 @@ on:
   push:
     tags:
       - "v*"
+
 permissions:
   contents: write
   actions: read
+
 jobs:
+  metadata:
+    name: Prepare Metadata
+    runs-on: ubuntu-latest
+    outputs:
+      build_time: ${{ steps.set-build-time.outputs.build_time }}
+    steps:
+      - name: Set build time
+        id: set-build-time
+        shell: bash
+        run: |
+          echo "build_time=$(date -u +'%Y-%m-%d %H:%M:%S UTC')" >> "$GITHUB_OUTPUT"
+
   build:
+    name: Build ${{ matrix.artifact_name }}
+    needs: metadata
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
         include:
-          - goos: android
-            goarch: arm64
-          - goos: darwin
-            goarch: amd64
-          - goos: darwin
-            goarch: arm64
-          - goos: dragonfly
-            goarch: amd64
-          - goos: freebsd
-            goarch: 386
-          - goos: freebsd
-            goarch: amd64
-          - goos: freebsd
-            goarch: arm
-          - goos: freebsd
-            goarch: arm64
-          - goos: linux
-            goarch: 386
-          - goos: linux
-            goarch: amd64
-          - goos: linux
-            goarch: arm
-          - goos: linux
-            goarch: arm64
-          - goos: linux
-            goarch: mips
-          - goos: linux
-            goarch: mips64
-          - goos: linux
-            goarch: mips64le
-          - goos: linux
-            goarch: mipsle
-          - goos: linux
-            goarch: ppc64
-          - goos: linux
-            goarch: ppc64le
-          - goos: linux
-            goarch: riscv64
-          - goos: linux
-            goarch: s390x
-          - goos: netbsd
-            goarch: 386
-          - goos: netbsd
-            goarch: amd64
-          - goos: netbsd
-            goarch: arm
-          - goos: netbsd
-            goarch: arm64
-          - goos: openbsd
-            goarch: 386
-          - goos: openbsd
-            goarch: amd64
-          - goos: openbsd
-            goarch: arm
-          - goos: openbsd
-            goarch: arm64
-          - goos: plan9
-            goarch: 386
-          - goos: plan9
-            goarch: amd64
-          - goos: solaris
-            goarch: amd64
-          - goos: windows
-            goarch: 386
-            ext: ".exe"
-          - goos: windows
-            goarch: amd64
-            ext: ".exe"
-          - goos: windows
-            goarch: arm
-            ext: ".exe"
-          - goos: windows
-            goarch: arm64
-            ext: ".exe"
-    outputs: # 添加作业输出
-      build_time: ${{ steps.set-build-time.outputs.BUILD_TIME }}
+          - target: x86_64-unknown-linux-gnu
+            artifact_name: iptest-linux-amd64
+            binary_name: iptest
+            build_command: cargo
+          - target: aarch64-unknown-linux-gnu
+            artifact_name: iptest-linux-arm64
+            binary_name: iptest
+            build_command: cargo
+          - target: x86_64-pc-windows-msvc
+            artifact_name: iptest-windows-amd64.exe
+            binary_name: iptest.exe
+            build_command: xwin
+          - target: aarch64-pc-windows-msvc
+            artifact_name: iptest-windows-arm64.exe
+            binary_name: iptest.exe
+            build_command: xwin
+          - target: x86_64-apple-darwin
+            artifact_name: iptest-darwin-amd64
+            binary_name: iptest
+            build_command: cargo
+          - target: aarch64-apple-darwin
+            artifact_name: iptest-darwin-arm64
+            binary_name: iptest
+            build_command: cargo
+
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0 # 获取完整提交历史
+          fetch-depth: 0
 
-      - name: Setup Go
-        uses: actions/setup-go@v6
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
         with:
-          go-version: "1.24.4" # 根据你的需求设置Go版本
-          cache: false
+          targets: ${{ matrix.target }}
 
-      - name: Create Release Assets Directory
-        run: mkdir -p "${{ github.workspace }}/release_assets"
+      - name: Cache Rust dependencies
+        uses: swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
 
-      - name: Set Build Time
-        id: set-build-time # 给步骤设置ID
+      - name: Install shared build dependencies
+        shell: bash
         run: |
-          build_time=$(date -u +'%Y-%m-%d %H:%M:%S UTC')
-          echo "BUILD_TIME=$build_time" >> $GITHUB_OUTPUT
+          sudo apt-get update
+          sudo apt-get install -y \
+            clang \
+            gcc-aarch64-linux-gnu \
+            lld \
+            pkg-config \
+            unzip \
+            zip
+
+      - name: Install cargo-xwin
+        if: contains(matrix.target, 'windows-msvc')
+        shell: bash
+        run: cargo install cargo-xwin --locked
+
+      - name: Setup osxcross
+        if: contains(matrix.target, 'apple-darwin')
+        uses: mbround18/setup-osxcross@v1
+        with:
+          osx-version: "14.0"
+
+      - name: Prepare release assets directory
+        shell: bash
+        run: mkdir -p "${GITHUB_WORKSPACE}/release_assets"
+
+      - name: Configure target linker
+        shell: bash
+        run: |
+          case "${{ matrix.target }}" in
+            aarch64-unknown-linux-gnu)
+              echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc" >> "$GITHUB_ENV"
+              ;;
+            x86_64-apple-darwin)
+              echo "CARGO_TARGET_X86_64_APPLE_DARWIN_LINKER=o64-clang" >> "$GITHUB_ENV"
+              echo "CC_x86_64_apple_darwin=o64-clang" >> "$GITHUB_ENV"
+              echo "CXX_x86_64_apple_darwin=o64-clang++" >> "$GITHUB_ENV"
+              ;;
+            aarch64-apple-darwin)
+              echo "CARGO_TARGET_AARCH64_APPLE_DARWIN_LINKER=oa64-clang" >> "$GITHUB_ENV"
+              echo "CC_aarch64_apple_darwin=oa64-clang" >> "$GITHUB_ENV"
+              echo "CXX_aarch64_apple_darwin=oa64-clang++" >> "$GITHUB_ENV"
+              ;;
+          esac
 
       - name: Build
+        shell: bash
         run: |
-          echo "Building iptest-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.ext || '' }} from iptest.go..."
-          go build -o ${{ github.workspace }}/release_assets/iptest-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.ext || '' }} go/iptest.go
-        env:
-         GOARCH: ${{ matrix.goarch }}
-         GOOS: ${{ matrix.goos }} 
+          echo "Building ${{ matrix.artifact_name }} for ${{ matrix.target }}"
 
-      - name: Generate SHA256
+          if [ "${{ matrix.build_command }}" = "xwin" ]; then
+            cargo xwin build --release --locked --target "${{ matrix.target }}"
+          else
+            cargo build --release --locked --target "${{ matrix.target }}"
+          fi
+
+      - name: Package binary and checksum
+        shell: bash
         run: |
-          cd "${{ github.workspace }}/release_assets"
-          for file in $(find . -type f ! -name '*.sha256'); do
-            sha256sum "$file" | awk '{print $1}' > "${file}.sha256"
-          done
-          echo "SHA256 files generated:"
-          ls -1 *.sha256
+          built_binary="${GITHUB_WORKSPACE}/target/${{ matrix.target }}/release/${{ matrix.binary_name }}"
+          asset_path="${GITHUB_WORKSPACE}/release_assets/${{ matrix.artifact_name }}"
 
-      - name: Upload Artifact
+          cp "$built_binary" "$asset_path"
+
+          hash="$(sha256sum "$asset_path" | awk '{print $1}')"
+          printf '%s *%s\n' "$hash" "${{ matrix.artifact_name }}" > "${asset_path}.sha256"
+
+          ls -lh "${GITHUB_WORKSPACE}/release_assets"
+
+      - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: iptest-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.ext || '' }}
+          name: ${{ matrix.artifact_name }}
           path: ${{ github.workspace }}/release_assets/*
 
   release:
     name: Release
-    needs: build
+    needs:
+      - metadata
+      - build
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout code
+      - name: Download artifacts
         uses: actions/download-artifact@v4
         with:
           path: artifacts
 
-      - name: Move Release Assets
+      - name: Collect release assets
+        shell: bash
         run: |
           mkdir -p release_assets
           find artifacts -type f ! -name "*.txt" -exec mv {} release_assets/ \;
           echo "Files to release:"
           ls -lh release_assets/
 
-      - name: Create Release
+      - name: Create release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ github.event.inputs.release_tag || github.ref_name }}
-          name: "Release ${{ github.event.inputs.release_tag || github.ref_name }}"
+          name: Release ${{ github.event.inputs.release_tag || github.ref_name }}
           body: |
-            ## 多平台构建版本
-            **构建时间:** ${{ needs.build.outputs.build_time }}
+            ## Rust 多平台构建版本
+            **构建时间:** ${{ needs.metadata.outputs.build_time }}
 
-            完整变更日志:  
-            https://github.com/Kwisma/iptest/commits/${{ github.event.inputs.release_tag || github.ref_name }}
+            已包含以下平台产物：
+            - Windows amd64
+            - Windows arm64
+            - Linux amd64
+            - Linux arm64
+            - macOS amd64
+            - macOS arm64
+
+            每个二进制文件均附带 `.sha256` 校验文件。
           files: |
             ${{ github.workspace }}/release_assets/*
           draft: false
