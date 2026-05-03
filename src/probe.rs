@@ -7,7 +7,9 @@ use std::{
 };
 
 use anyhow::{Context, Result, anyhow};
+use bytes::{BufMut, BytesMut};
 use maxminddb::Reader;
+use memchr::memmem;
 use rustls_pki_types::ServerName;
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
@@ -19,7 +21,7 @@ use tokio_rustls::TlsConnector;
 use crate::{
     model::{IpEntry, Location, Opts, ProbeResult, TargetUrl},
     runtime::{
-        CONNECT_TIMEOUT, HEADER_BUFFER_LIMIT, SPEED_TIMEOUT, TRACE_HOST, TRACE_PATH, TRACE_READ_LIMIT,
+        CONNECT_TIMEOUT, HEADER_BUFFER_LIMIT, SPEED_TIMEOUT, TRACE_HOST, TRACE_READ_LIMIT,
         TRACE_TIMEOUT,
     },
 };
@@ -41,17 +43,16 @@ pub async fn probe_ip(
         return None;
     }
 
-    let request = build_trace_request();
     let response = timeout(TRACE_TIMEOUT, async {
         if opts.tls {
-            let server_name = ServerName::try_from(TRACE_HOST.to_string()).ok()?;
+            let server_name = ServerName::try_from(TRACE_HOST).ok()?;
             let mut tls_stream = tls_connector.connect(server_name, stream).await.ok()?;
-            write_and_read_limited(&mut tls_stream, request.as_bytes(), TRACE_READ_LIMIT)
+            write_and_read_limited(&mut tls_stream, TRACE_REQUEST, TRACE_READ_LIMIT)
                 .await
                 .ok()
         } else {
             let mut plain = stream;
-            write_and_read_limited(&mut plain, request.as_bytes(), TRACE_READ_LIMIT)
+            write_and_read_limited(&mut plain, TRACE_REQUEST, TRACE_READ_LIMIT)
                 .await
                 .ok()
         }
@@ -60,7 +61,7 @@ pub async fn probe_ip(
     .ok()??;
 
     let body = extract_http_body(&response);
-    let body_text = String::from_utf8_lossy(body).to_string();
+    let body_text = String::from_utf8_lossy(body);
     if !body_text.contains("uag=Mozilla/5.0") {
         return None;
     }
@@ -68,11 +69,12 @@ pub async fn probe_ip(
     let response_data = parse_trace_response(&body_text);
     let data_center = response_data.get("colo")?.to_string();
     let loc_code = response_data.get("loc")?.to_string();
-    let outbound_ip = response_data.get("ip").cloned().unwrap_or_default();
-    let ip_type = get_ip_type(&outbound_ip).to_string();
+    let field = |k: &str| response_data.get(k).map(|v| v.to_string()).unwrap_or_default();
+    let outbound_ip = response_data.get("ip").copied().unwrap_or("");
+    let ip_type = get_ip_type(outbound_ip).to_string();
     let location = location_map.get(&data_center);
 
-    let (asn_number, asn_org) = lookup_asn(asn_db, &outbound_ip);
+    let (asn_number, asn_org) = lookup_asn(asn_db, outbound_ip);
 
     Some(ProbeResult {
         ip: entry.ip,
@@ -87,17 +89,17 @@ pub async fn probe_ip(
         emoji: location.map(|l| l.emoji.clone()).unwrap_or_default(),
         latency_ms: tcp_duration.as_millis(),
         tcp_duration,
-        outbound_ip,
+        outbound_ip: outbound_ip.to_string(),
         ip_type,
-        visit_scheme: response_data.get("visit_scheme").cloned().unwrap_or_default(),
-        tls_version: response_data.get("tls").cloned().unwrap_or_default(),
-        sni: response_data.get("sni").cloned().unwrap_or_default(),
-        http_version: response_data.get("http").cloned().unwrap_or_default(),
-        warp: response_data.get("warp").cloned().unwrap_or_default(),
-        gateway: response_data.get("gateway").cloned().unwrap_or_default(),
-        rbi: response_data.get("rbi").cloned().unwrap_or_default(),
-        kex: response_data.get("kex").cloned().unwrap_or_default(),
-        timestamp: response_data.get("ts").cloned().unwrap_or_default(),
+        visit_scheme: field("visit_scheme"),
+        tls_version: field("tls"),
+        sni: field("sni"),
+        http_version: field("http"),
+        warp: field("warp"),
+        gateway: field("gateway"),
+        rbi: field("rbi"),
+        kex: field("kex"),
+        timestamp: field("ts"),
         autonomous_system_number: asn_number,
         autonomous_system_organization: asn_org,
         download_speed: None,
@@ -116,7 +118,6 @@ pub async fn speed_test_ip(
         Err(_) => return 0.0,
     };
 
-    let request = build_speed_request(target);
     let start = Instant::now();
     let stream = match timeout(CONNECT_TIMEOUT, TcpStream::connect(address)).await {
         Ok(Ok(stream)) => stream,
@@ -133,12 +134,12 @@ pub async fn speed_test_ip(
             Ok(Ok(stream)) => stream,
             _ => return 0.0,
         };
-        count_http_body_bytes(&mut tls_stream, request.as_bytes(), SPEED_TIMEOUT)
+        count_http_body_bytes(&mut tls_stream, &target.speed_request[..], SPEED_TIMEOUT)
             .await
             .unwrap_or(0)
     } else {
         let mut plain = stream;
-        count_http_body_bytes(&mut plain, request.as_bytes(), SPEED_TIMEOUT)
+        count_http_body_bytes(&mut plain, &target.speed_request[..], SPEED_TIMEOUT)
             .await
             .unwrap_or(0)
     };
@@ -170,30 +171,25 @@ pub fn build_target_url(raw: &str, enable_tls: bool) -> Result<TargetUrl> {
         path = "/".to_string();
     }
 
+    let referer_raw = format!("https://{host}/");
+    let mut req = BytesMut::with_capacity(256 + path.len() + host.len() + referer_raw.len());
+    req.put_slice(b"GET ");
+    req.put_slice(path.as_bytes());
+    req.put_slice(b" HTTP/1.1\r\nHost: ");
+    req.put_slice(host.as_bytes());
+    req.put_slice(b"\r\nUser-Agent: Mozilla/5.0\r\nReferer: ");
+    req.put_slice(referer_raw.as_bytes());
+    req.put_slice(b"\r\nAccept: */*\r\nAccept-Encoding: identity\r\nConnection: close\r\n\r\n");
+
     Ok(TargetUrl {
-        host: host.clone(),
+        host,
         path_and_query: path,
-        referer: Some(format!("https://{host}/")),
+        referer: Some(referer_raw),
+        speed_request: req.to_vec(),
     })
 }
 
-fn build_trace_request() -> String {
-    format!(
-        "GET {} HTTP/1.1\r\nHost: {}\r\nUser-Agent: Mozilla/5.0\r\nAccept: */*\r\nAccept-Encoding: identity\r\nConnection: close\r\n\r\n",
-        TRACE_PATH, TRACE_HOST
-    )
-}
-
-fn build_speed_request(target: &TargetUrl) -> String {
-    let referer = target
-        .referer
-        .as_deref()
-        .unwrap_or("https://speed.cloudflare.com/");
-    format!(
-        "GET {} HTTP/1.1\r\nHost: {}\r\nUser-Agent: Mozilla/5.0\r\nReferer: {}\r\nAccept: */*\r\nAccept-Encoding: identity\r\nConnection: close\r\n\r\n",
-        target.path_and_query, target.host, referer
-    )
-}
+const TRACE_REQUEST: &[u8] = b"GET /cdn-cgi/trace HTTP/1.1\r\nHost: speed.cloudflare.com\r\nUser-Agent: Mozilla/5.0\r\nAccept: */*\r\nAccept-Encoding: identity\r\nConnection: close\r\n\r\n";
 
 async fn write_and_read_limited<T>(stream: &mut T, request: &[u8], limit: usize) -> Result<Vec<u8>>
 where
@@ -252,7 +248,7 @@ where
         }
 
         header_buf.extend_from_slice(&buf[..n]);
-        if let Some(pos) = find_bytes(&header_buf, b"\r\n\r\n") {
+        if let Some(pos) = memmem::find(&header_buf, b"\r\n\r\n") {
             let body_start = pos + 4;
             if header_buf.len() > body_start {
                 total += header_buf.len() - body_start;
@@ -267,12 +263,12 @@ where
 }
 
 fn extract_http_body(response: &[u8]) -> &[u8] {
-    find_bytes(response, b"\r\n\r\n")
+    memmem::find(response, b"\r\n\r\n")
         .map(|pos| &response[pos + 4..])
         .unwrap_or(response)
 }
 
-fn parse_trace_response(body: &str) -> HashMap<String, String> {
+fn parse_trace_response<'a>(body: &'a str) -> HashMap<&'a str, &'a str> {
     body.lines()
         .filter_map(|line| {
             let trimmed = line.trim();
@@ -280,7 +276,7 @@ fn parse_trace_response(body: &str) -> HashMap<String, String> {
                 return None;
             }
             let (key, value) = trimmed.split_once('=')?;
-            Some((key.trim().to_string(), value.trim().to_string()))
+            Some((key.trim(), value.trim()))
         })
         .collect()
 }
@@ -318,8 +314,4 @@ fn get_ip_type(ip: &str) -> &'static str {
 fn parse_socket_addr(ip: &str, port: u16) -> Result<SocketAddr> {
     let ip_addr = IpAddr::from_str(ip).with_context(|| format!("无效 IP: {ip}"))?;
     Ok(SocketAddr::new(ip_addr, port))
-}
-
-fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    haystack.windows(needle.len()).position(|window| window == needle)
 }

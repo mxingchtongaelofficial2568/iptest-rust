@@ -120,13 +120,15 @@ pub async fn write_csv(path: &Path, rows: &[ProbeResult], enable_tls: bool, with
     Ok(())
 }
 
-pub fn print_summary(output_path: &Path, valid_count: usize, elapsed: Duration, with_speed: bool) {
+pub fn print_summary(output_path: Option<&Path>, valid_count: usize, elapsed: Duration, with_speed: bool) {
     let mode = if with_speed { "延迟 + 下载测速" } else { "仅延迟探测" };
     println!();
     println!("{}", "════════════════════════════════════════════════════════════".blue());
     println!("{} {}", "运行模式:".bold(), mode.green().bold());
     println!("{} {}", "有效IP数量:".bold(), valid_count.to_string().cyan().bold());
-    println!("{} {}", "结果文件:".bold(), output_path.display().to_string().yellow());
+    if let Some(path) = output_path {
+        println!("{} {}", "结果文件:".bold(), path.display().to_string().yellow());
+    }
     println!("{} {:.2} 秒", "总耗时:".bold(), elapsed.as_secs_f64());
     println!("{}", "════════════════════════════════════════════════════════════".blue());
 }

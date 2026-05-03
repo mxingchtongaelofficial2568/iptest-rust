@@ -11,8 +11,8 @@ pub struct Opts {
     #[arg(long = "file", default_value = "ip.txt", help = "IP地址文件名称,格式为 ip port")]
     pub file: String,
 
-    #[arg(long = "outfile", default_value = "ip.csv", help = "输出文件名称")]
-    pub outfile: String,
+    #[arg(long = "outfile", help = "输出CSV文件名称，未指定且开启--edgetunnel时不生成CSV")]
+    pub outfile: Option<String>,
 
     #[arg(long = "max", default_value_t = 100, help = "并发请求最大协程数")]
     pub max_threads: usize,
@@ -28,14 +28,17 @@ pub struct Opts {
 
     #[arg(long = "delay", default_value_t = 0, help = "延迟阈值(ms)，默认为0禁用延迟过滤")]
     pub delay: u64,
+
+    #[arg(
+        long = "edgetunnel",
+        help = "生成EdgeTunnel分组txt文件，需指定输出名称 e.g. --edgetunnel edgetunnel.txt"
+    )]
+    pub edgetunnel: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct Location {
     pub iata: String,
-    #[serde(default)]
-    #[allow(dead_code)]
-    pub cca2: String,
     #[serde(default)]
     pub region: String,
     #[serde(default)]
@@ -87,8 +90,10 @@ pub struct ProbeResult {
 }
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct TargetUrl {
     pub host: String,
     pub path_and_query: String,
     pub referer: Option<String>,
+    pub speed_request: Vec<u8>,
 }

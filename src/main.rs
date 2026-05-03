@@ -2,8 +2,10 @@ mod model;
 mod output;
 mod probe;
 mod runtime;
+mod edgetunnel;
 
 use std::{
+    borrow::Cow,
     collections::HashMap,
     sync::{
         Arc,
@@ -16,6 +18,7 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use futures::{StreamExt, stream};
 use indicatif::MultiProgress;
+use mimalloc::MiMalloc;
 use owo_colors::OwoColorize;
 use reqwest::Client;
 
@@ -29,14 +32,31 @@ use crate::{
     },
 };
 
-#[tokio::main]
-async fn main() {
+#[global_allocator]
+static GLOBAL: MiMalloc = MiMalloc;
+
+fn main() {
     let _ = rustls::crypto::ring::default_provider().install_default();
 
-    if let Err(err) = run().await {
-        eprintln!("{} {}", "[错误]".red().bold(), err);
-        std::process::exit(1);
-    }
+    let workers = std::thread::available_parallelism()
+        .map(|n| n.get() * 2)
+        .unwrap_or(8);
+
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(workers)
+        .max_blocking_threads(128)
+        .thread_name("iptest-worker")
+        .max_io_events_per_tick(64)
+        .enable_all()
+        .build()
+        .expect("Failed to build Tokio runtime");
+
+    runtime.block_on(async {
+        if let Err(err) = run().await {
+            eprintln!("{} {}", "[错误]".red().bold(), err);
+            std::process::exit(1);
+        }
+    });
 }
 
 fn update_min(target: &AtomicU64, candidate: u64) {
@@ -59,19 +79,19 @@ fn update_max(target: &AtomicU64, candidate: u64) {
     }
 }
 
-fn format_best_latency_ms(value: u64) -> String {
+fn format_best_latency_ms(value: u64) -> Cow<'static, str> {
     if value == u64::MAX {
-        "--".to_string()
+        Cow::Borrowed("--")
     } else {
-        format!("{value} ms")
+        Cow::Owned(format!("{value} ms"))
     }
 }
 
-fn format_best_speed_kbps(value: u64) -> String {
+fn format_best_speed_kbps(value: u64) -> Cow<'static, str> {
     if value == 0 {
-        "--".to_string()
+        Cow::Borrowed("--")
     } else {
-        format!("{value} kB/s")
+        Cow::Owned(format!("{value} kB/s"))
     }
 }
 
@@ -79,7 +99,10 @@ async fn run() -> Result<()> {
     let opts = Opts::parse_from(normalize_args(std::env::args()));
     let base_dir = runtime_base_dir()?;
     let input_path = resolve_runtime_path(&base_dir, &opts.file);
-    let output_path = resolve_runtime_path(&base_dir, &opts.outfile);
+    let csv_path = opts.outfile.as_ref().map(|f| resolve_runtime_path(&base_dir, f));
+    let edgetunnel_path = opts.edgetunnel.as_ref().map(|f| resolve_runtime_path(&base_dir, f));
+    let should_write_csv = csv_path.is_some() || edgetunnel_path.is_none();
+    let csv_path = csv_path.unwrap_or_else(|| resolve_runtime_path(&base_dir, "ip.csv"));
     let started = Instant::now();
 
     let multi = Arc::new(MultiProgress::new());
@@ -116,22 +139,23 @@ async fn run() -> Result<()> {
         return Ok(());
     }
 
-    setup_pb.finish_with_message(format!(
-        "初始化完成 | 运行目录: {} | 待扫描 IP: {}",
+    setup_pb.finish_and_clear();
+    println!(
+        "{} {} | 运行目录: {} | 待扫描 IP: {}",
+        "✓".green().bold(),
+        "初始化完成",
         base_dir.display(),
         ips.len()
-    ));
+    );
 
     let valid_count = Arc::new(AtomicUsize::new(0));
-    let scan_done = Arc::new(AtomicUsize::new(0));
     let best_latency_ms = Arc::new(AtomicU64::new(u64::MAX));
-    let scan_total = ips.len();
     let scan_pb = multi.add(progress_bar(
         ips.len() as u64,
         "探测有效 IP",
         "{spinner:.cyan} {prefix:.bold.dim} [{elapsed_precise}<{eta_precise}] [{bar:40.cyan/blue}] {pos}/{len} {per_sec} {msg}",
     )?);
-    scan_pb.set_message("有效 0 | 最快 -- | 活跃 0".to_string());
+    scan_pb.set_message("有效 0 / 最快 --".to_string());
 
     let scan_parallelism = opts.max_threads.max(1);
     let mut probe_results = stream::iter(ips.into_iter().map(|entry| {
@@ -140,7 +164,6 @@ async fn run() -> Result<()> {
         let asn_db = asn_db.clone();
         let scan_pb = scan_pb.clone();
         let valid_count = Arc::clone(&valid_count);
-        let scan_done = Arc::clone(&scan_done);
         let best_latency_ms = Arc::clone(&best_latency_ms);
         let opts = opts.clone();
         async move {
@@ -162,22 +185,16 @@ async fn run() -> Result<()> {
                     item.ip_type.as_str().blue(),
                     item.latency_ms.to_string().yellow()
                 ));
-                let completed = scan_done.fetch_add(1, Ordering::Relaxed) + 1;
-                let active = scan_total.saturating_sub(completed);
                 scan_pb.set_message(format!(
-                    "有效 {} | 最快 {} | 活跃 {}",
+                    "有效 {} / 最快 {}",
                     found,
                     format_best_latency_ms(best_latency_ms.load(Ordering::Relaxed)),
-                    active
                 ));
             } else {
-                let completed = scan_done.fetch_add(1, Ordering::Relaxed) + 1;
-                let active = scan_total.saturating_sub(completed);
                 scan_pb.set_message(format!(
-                    "有效 {} | 最快 {} | 活跃 {}",
+                    "有效 {} / 最快 {}",
                     valid_count.load(Ordering::Relaxed),
                     format_best_latency_ms(best_latency_ms.load(Ordering::Relaxed)),
-                    active
                 ));
             }
             scan_pb.inc(1);
@@ -235,10 +252,11 @@ async fn run() -> Result<()> {
                     total
                 ));
                 speed_pb.println(format!(
-                    "{} {}:{}  {:.0} kB/s",
+                    "{} {}:{}  {}  {:.0} kB/s",
                     "⇣".magenta().bold(),
                     updated.ip.cyan(),
                     updated.port.to_string().cyan(),
+                    if updated.city_zh.is_empty() { "位置未知" } else { &updated.city_zh },
                     speed
                 ));
                 updated
@@ -258,12 +276,24 @@ async fn run() -> Result<()> {
                 .partial_cmp(&a.download_speed.unwrap_or(0.0))
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
-        write_csv(&output_path, &speed_results, opts.tls, true).await?;
-        print_summary(&output_path, speed_results.len(), started.elapsed(), true);
+        if should_write_csv {
+            write_csv(&csv_path, &speed_results, opts.tls, true).await?;
+        }
+        if let Some(ref txt_path) = edgetunnel_path {
+            edgetunnel::convert(&speed_results, txt_path)?;
+        }
+        let csv_output = should_write_csv.then(|| csv_path.as_path());
+        print_summary(csv_output, speed_results.len(), started.elapsed(), true);
     } else {
         results.sort_by_key(|item| item.tcp_duration);
-        write_csv(&output_path, &results, opts.tls, false).await?;
-        print_summary(&output_path, results.len(), started.elapsed(), false);
+        if should_write_csv {
+            write_csv(&csv_path, &results, opts.tls, false).await?;
+        }
+        if let Some(ref txt_path) = edgetunnel_path {
+            edgetunnel::convert(&results, txt_path)?;
+        }
+        let csv_output = should_write_csv.then(|| csv_path.as_path());
+        print_summary(csv_output, results.len(), started.elapsed(), false);
     }
 
     Ok(())

@@ -16,6 +16,7 @@ use tokio_rustls::TlsConnector;
 use crate::model::{IpEntry, Location};
 
 pub const TRACE_HOST: &str = "speed.cloudflare.com";
+#[allow(dead_code)]
 pub const TRACE_PATH: &str = "/cdn-cgi/trace";
 pub const LOCATIONS_URL: &str = "https://locations-adw.pages.dev/";
 pub const ASN_DB_URL: &str = "https://jsd.onmicrosoft.cn/gh/seketiti/GeoLiet2@release/GeoLite2-ASN.mmdb";
