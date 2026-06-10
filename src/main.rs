@@ -6,7 +6,7 @@ mod edgetunnel;
 
 use std::{
     borrow::Cow,
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     sync::{
         Arc,
         atomic::{AtomicU64, AtomicUsize, Ordering},
@@ -139,6 +139,34 @@ async fn run() -> Result<()> {
         return Ok(());
     }
 
+    if opts.filter {
+        setup_pb.finish_and_clear();
+        let filter_path = input_path.with_file_name(format!(
+            "{}_filter.txt",
+            input_path.file_stem().unwrap_or_default().to_string_lossy()
+        ));
+        let mut seen_ip = HashSet::new();
+        let mut filtered = Vec::new();
+        for entry in &ips {
+            if seen_ip.insert(&entry.ip) {
+                filtered.push(entry.clone());
+            }
+        }
+        let mut content = String::new();
+        for entry in &filtered {
+            if entry.name.is_empty() {
+                content.push_str(&format!("{}:{}\n", entry.ip, entry.port));
+            } else {
+                content.push_str(&format!("{}:{}#{}\n", entry.ip, entry.port, entry.name));
+            }
+        }
+        tokio::fs::write(&filter_path, &content).await
+            .with_context(|| format!("无法写入过滤文件: {}", filter_path.display()))?;
+        println!("{} 过滤完成 | 原始 {} 条 -> 去重后 {} 条", "[过滤]".green().bold(), ips.len(), filtered.len());
+        println!("  💾 输出文件: {}", filter_path.display());
+        return Ok(());
+    }
+
     setup_pb.finish_and_clear();
     println!(
         "{} {} | 运行目录: {} | 待扫描 IP: {}",
@@ -177,13 +205,14 @@ async fn run() -> Result<()> {
                     item.city_zh.clone()
                 };
                 scan_pb.println(format!(
-                    "{} {}:{}  {}  {}  {} ms",
+                    "{} {}:{}  {}  {}  {} ms  {}",
                     "✓".green().bold(),
                     item.ip.cyan(),
                     item.port.to_string().cyan(),
                     place,
                     item.ip_type.as_str().blue(),
-                    item.latency_ms.to_string().yellow()
+                    item.latency_ms.to_string().yellow(),
+                    item.name.dimmed(),
                 ));
                 scan_pb.set_message(format!(
                     "有效 {} / 最快 {}",
@@ -218,6 +247,7 @@ async fn run() -> Result<()> {
     }
 
     if opts.speedtest > 0 {
+        let speed_threshold_kbps = opts.speed_threshold_kbps();
         let speed_target = build_target_url(&opts.url, opts.tls)?;
         let speed_pb = multi.add(progress_bar(
             results.len() as u64,
@@ -252,12 +282,13 @@ async fn run() -> Result<()> {
                     total
                 ));
                 speed_pb.println(format!(
-                    "{} {}:{}  {}  {:.0} kB/s",
+                    "{} {}:{}  {}  {:.0} kB/s  {}",
                     "⇣".magenta().bold(),
                     updated.ip.cyan(),
                     updated.port.to_string().cyan(),
                     if updated.city_zh.is_empty() { "位置未知" } else { &updated.city_zh },
-                    speed
+                    speed,
+                    updated.name.dimmed(),
                 ));
                 updated
             }
@@ -270,6 +301,9 @@ async fn run() -> Result<()> {
         }
 
         speed_pb.finish_with_message("测速完成".to_string());
+        if speed_threshold_kbps > 0.0 {
+            speed_results.retain(|item| item.download_speed.unwrap_or(0.0) >= speed_threshold_kbps);
+        }
         speed_results.sort_by(|a, b| {
             b.download_speed
                 .unwrap_or(0.0)

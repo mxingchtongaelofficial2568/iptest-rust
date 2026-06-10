@@ -5,9 +5,6 @@ use owo_colors::OwoColorize;
 
 use crate::model::ProbeResult;
 
-const MIN_SPEED_KB: f64 = 500.0;
-const MIN_LATENCY_MS: f64 = 20.0;
-
 struct Entry {
     score: f64,
     line: String,
@@ -19,9 +16,6 @@ pub fn convert(data: &[ProbeResult], output_path: &Path) -> Result<()> {
     for item in data {
         let speed_kbps = item.download_speed.unwrap_or(0.0);
         let latency = item.latency_ms;
-        if speed_kbps < MIN_SPEED_KB || (latency as f64) < MIN_LATENCY_MS {
-            continue;
-        }
 
         let speed_mb = speed_kbps / 1024.0;
         let score = speed_mb / (latency.max(1) as f64);
@@ -33,8 +27,20 @@ pub fn convert(data: &[ProbeResult], output_path: &Path) -> Result<()> {
         let country = if item.country.is_empty() { "Unknown" } else { &item.country };
 
         let line = match IpAddr::from_str(&item.ip) {
-            Ok(IpAddr::V6(_)) => format!("[{}]:{}#{}({})", item.ip, item.port, country, metric),
-            _ => format!("{}:{}#{}({})", item.ip, item.port, country, metric),
+            Ok(IpAddr::V6(_)) => {
+                if item.name.is_empty() {
+                    format!("[{}]:{}#{}({})", item.ip, item.port, country, metric)
+                } else {
+                    format!("[{}]:{}#{} ({} {})", item.ip, item.port, country, metric, item.name)
+                }
+            }
+            _ => {
+                if item.name.is_empty() {
+                    format!("{}:{}#{}({})", item.ip, item.port, country, metric)
+                } else {
+                    format!("{}:{}#{} ({} {})", item.ip, item.port, country, metric, item.name)
+                }
+            }
         };
 
         countries.entry(country).or_default().push(Entry { score, line });

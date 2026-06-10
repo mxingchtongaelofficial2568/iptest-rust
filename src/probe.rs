@@ -1,19 +1,21 @@
 use std::{
     collections::HashMap,
+    hash::{Hash, Hasher},
     net::{IpAddr, SocketAddr},
     str::FromStr,
     sync::Arc,
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result, anyhow};
-use bytes::{BufMut, BytesMut};
+use bytes::Bytes;
+use http_body_util::{BodyExt, Full};
+use hyper::{Request as HyperRequest, client::conn::http1};
+use hyper_util::rt::TokioIo;
 use maxminddb::Reader;
-use memchr::memmem;
 use rustls_pki_types::ServerName;
 use tokio::{
-    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
-    net::TcpStream,
+    io::{AsyncRead, AsyncWrite},
     time::timeout,
 };
 use tokio_rustls::TlsConnector;
@@ -21,10 +23,13 @@ use tokio_rustls::TlsConnector;
 use crate::{
     model::{IpEntry, Location, Opts, ProbeResult, TargetUrl},
     runtime::{
-        CONNECT_TIMEOUT, HEADER_BUFFER_LIMIT, SPEED_TIMEOUT, TRACE_HOST, TRACE_READ_LIMIT,
-        TRACE_TIMEOUT,
+        CONNECT_TIMEOUT, SPEED_TIMEOUT, TLS_HANDSHAKE_TIMEOUT,
+        TRACE_HOST, TRACE_TIMEOUT,
     },
 };
+
+const LATENCY_SAMPLES: u32 = 3;
+const SOCKET_BUFFER_SIZE: u32 = 4 * 1024 * 1024;
 
 pub async fn probe_ip(
     entry: IpEntry,
@@ -34,34 +39,58 @@ pub async fn probe_ip(
     tls_connector: &TlsConnector,
 ) -> Option<ProbeResult> {
     let address = parse_socket_addr(&entry.ip, entry.port).ok()?;
-    let start = Instant::now();
-    let stream = timeout(CONNECT_TIMEOUT, TcpStream::connect(address)).await.ok()?.ok()?;
-    let _ = stream.set_nodelay(true);
-    let tcp_duration = start.elapsed();
+
+    // Fix 8: stagger connections to reduce epoll/IOCP pressure under high concurrency
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    entry.ip.hash(&mut hasher);
+    let stagger_ms = (hasher.finish() % 10) as u64;
+    tokio::time::sleep(std::time::Duration::from_millis(stagger_ms)).await;
+
+    // Fix 7: multiple samples to get minimum latency, avoiding scheduler jitter,
+    // ARP cache miss on first connect, and SYN retransmit outliers
+    let mut best_duration = std::time::Duration::MAX;
+    let mut best_stream = None;
+
+    for _ in 0..LATENCY_SAMPLES {
+        let socket = match create_socket(&address) {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+        let start = Instant::now();
+        match timeout(CONNECT_TIMEOUT, socket.connect(address)).await {
+            Ok(Ok(stream)) => {
+                let dur = start.elapsed();
+                if dur < best_duration {
+                    best_duration = dur;
+                    let _ = stream.set_nodelay(true);
+                    best_stream = Some(stream);
+                }
+            }
+            _ => continue,
+        }
+    }
+
+    let stream = best_stream?;
+    let tcp_duration = best_duration;
 
     if opts.delay > 0 && tcp_duration.as_millis() > u128::from(opts.delay) {
         return None;
     }
 
-    let response = timeout(TRACE_TIMEOUT, async {
+    let body_text = timeout(TRACE_TIMEOUT, async {
         if opts.tls {
             let server_name = ServerName::try_from(TRACE_HOST).ok()?;
-            let mut tls_stream = tls_connector.connect(server_name, stream).await.ok()?;
-            write_and_read_limited(&mut tls_stream, TRACE_REQUEST, TRACE_READ_LIMIT)
-                .await
-                .ok()
+            let tls_stream = tls_connector.connect(server_name, stream).await.ok()?;
+            hyper_trace(TokioIo::new(tls_stream), opts.tls).await
         } else {
-            let mut plain = stream;
-            write_and_read_limited(&mut plain, TRACE_REQUEST, TRACE_READ_LIMIT)
-                .await
-                .ok()
+            hyper_trace(TokioIo::new(stream), opts.tls).await
         }
     })
     .await
-    .ok()??;
+    .ok()
+    .flatten()
+    .unwrap_or_default();
 
-    let body = extract_http_body(&response);
-    let body_text = String::from_utf8_lossy(body);
     if !body_text.contains("uag=Mozilla/5.0") {
         return None;
     }
@@ -79,6 +108,7 @@ pub async fn probe_ip(
     Some(ProbeResult {
         ip: entry.ip,
         port: entry.port,
+        name: entry.name,
         data_center,
         loc_code,
         region: location.map(|l| l.region.clone()).unwrap_or_default(),
@@ -118,34 +148,92 @@ pub async fn speed_test_ip(
         Err(_) => return 0.0,
     };
 
-    let start = Instant::now();
-    let stream = match timeout(CONNECT_TIMEOUT, TcpStream::connect(address)).await {
+    let socket = match create_socket(&address) {
+        Ok(s) => s,
+        Err(_) => return 0.0,
+    };
+    let stream = match timeout(CONNECT_TIMEOUT, socket.connect(address)).await {
         Ok(Ok(stream)) => stream,
         _ => return 0.0,
     };
     let _ = stream.set_nodelay(true);
 
-    let downloaded = if enable_tls {
+    let (downloaded, elapsed) = if enable_tls {
         let server_name = match ServerName::try_from(target.host.clone()) {
             Ok(name) => name,
             Err(_) => return 0.0,
         };
-        let mut tls_stream = match timeout(SPEED_TIMEOUT, tls_connector.connect(server_name, stream)).await {
+        let tls_stream = match timeout(TLS_HANDSHAKE_TIMEOUT, tls_connector.connect(server_name, stream)).await {
             Ok(Ok(stream)) => stream,
             _ => return 0.0,
         };
-        count_http_body_bytes(&mut tls_stream, &target.speed_request[..], SPEED_TIMEOUT)
-            .await
-            .unwrap_or(0)
+        hyper_speed_test(TokioIo::new(tls_stream), target, "https", SPEED_TIMEOUT).await
     } else {
-        let mut plain = stream;
-        count_http_body_bytes(&mut plain, &target.speed_request[..], SPEED_TIMEOUT)
-            .await
-            .unwrap_or(0)
+        hyper_speed_test(TokioIo::new(stream), target, "http", SPEED_TIMEOUT).await
     };
 
-    let elapsed = start.elapsed().as_secs_f64().max(0.001);
-    downloaded as f64 / elapsed / 1024.0
+    let elapsed_secs = elapsed.as_secs_f64().max(0.001);
+    downloaded as f64 / elapsed_secs / 1024.0
+}
+
+async fn hyper_speed_test<T>(io: TokioIo<T>, target: &TargetUrl, scheme: &str, max_duration: Duration) -> (usize, Duration)
+where
+    T: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    let (mut sender, conn) = match timeout(max_duration, http1::handshake(io)).await {
+        Ok(Ok(pair)) => pair,
+        _ => return (0, Duration::ZERO),
+    };
+
+    tokio::spawn(async move {
+        let _ = conn.await;
+    });
+
+    let uri = format!("{}://{}{}", scheme, target.host, target.path_and_query);
+    let mut builder = HyperRequest::builder()
+        .method("GET")
+        .uri(&uri)
+        .header("Host", &target.host)
+        .header("User-Agent", "Mozilla/5.0")
+        .header("Accept", "*/*")
+        .header("Accept-Encoding", "identity")
+        .header("Connection", "close");
+    if let Some(ref referer) = target.referer {
+        builder = builder.header("Referer", referer.as_str());
+    }
+    let request = match builder.body(Full::new(Bytes::new())) {
+        Ok(req) => req,
+        Err(_) => return (0, Duration::ZERO),
+    };
+
+    let start = Instant::now();
+
+    let resp = match timeout(max_duration, sender.send_request(request)).await {
+        Ok(Ok(resp)) => resp,
+        _ => return (0, start.elapsed()),
+    };
+
+    let mut body = resp.into_body();
+    let mut total = 0usize;
+    let deadline = start + max_duration;
+
+    loop {
+        let now = Instant::now();
+        if now >= deadline {
+            break;
+        }
+        let remain = deadline - now;
+        match timeout(remain, body.frame()).await {
+            Ok(Some(Ok(frame))) => {
+                if let Ok(data) = frame.into_data() {
+                    total += data.len();
+                }
+            }
+            _ => break,
+        }
+    }
+
+    (total, start.elapsed())
 }
 
 pub fn build_target_url(raw: &str, enable_tls: bool) -> Result<TargetUrl> {
@@ -172,100 +260,53 @@ pub fn build_target_url(raw: &str, enable_tls: bool) -> Result<TargetUrl> {
     }
 
     let referer_raw = format!("https://{host}/");
-    let mut req = BytesMut::with_capacity(256 + path.len() + host.len() + referer_raw.len());
-    req.put_slice(b"GET ");
-    req.put_slice(path.as_bytes());
-    req.put_slice(b" HTTP/1.1\r\nHost: ");
-    req.put_slice(host.as_bytes());
-    req.put_slice(b"\r\nUser-Agent: Mozilla/5.0\r\nReferer: ");
-    req.put_slice(referer_raw.as_bytes());
-    req.put_slice(b"\r\nAccept: */*\r\nAccept-Encoding: identity\r\nConnection: close\r\n\r\n");
 
     Ok(TargetUrl {
         host,
         path_and_query: path,
         referer: Some(referer_raw),
-        speed_request: req.to_vec(),
     })
 }
 
-const TRACE_REQUEST: &[u8] = b"GET /cdn-cgi/trace HTTP/1.1\r\nHost: speed.cloudflare.com\r\nUser-Agent: Mozilla/5.0\r\nAccept: */*\r\nAccept-Encoding: identity\r\nConnection: close\r\n\r\n";
-
-async fn write_and_read_limited<T>(stream: &mut T, request: &[u8], limit: usize) -> Result<Vec<u8>>
-where
-    T: AsyncRead + AsyncWrite + Unpin,
-{
-    stream.write_all(request).await.context("发送请求失败")?;
-    stream.flush().await.context("刷新请求失败")?;
-
-    let mut data = Vec::with_capacity(4096);
-    let mut buf = [0u8; 4096];
-    loop {
-        let n = stream.read(&mut buf).await.context("读取响应失败")?;
-        if n == 0 {
-            break;
-        }
-        if data.len() + n > limit {
-            return Err(anyhow!("响应超过限制大小"));
-        }
-        data.extend_from_slice(&buf[..n]);
-    }
-    Ok(data)
+// Fix 9: create a TcpSocket with configured buffer sizes for high BDP links
+fn create_socket(addr: &SocketAddr) -> std::io::Result<tokio::net::TcpSocket> {
+    let socket = match addr {
+        SocketAddr::V4(_) => tokio::net::TcpSocket::new_v4()?,
+        SocketAddr::V6(_) => tokio::net::TcpSocket::new_v6()?,
+    };
+    let _ = socket.set_recv_buffer_size(SOCKET_BUFFER_SIZE);
+    let _ = socket.set_send_buffer_size(SOCKET_BUFFER_SIZE);
+    Ok(socket)
 }
 
-async fn count_http_body_bytes<T>(stream: &mut T, request: &[u8], max_duration: std::time::Duration) -> Result<usize>
+async fn hyper_trace<T>(io: TokioIo<T>, enable_tls: bool) -> Option<String>
 where
-    T: AsyncRead + AsyncWrite + Unpin,
+    T: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    stream.write_all(request).await.context("发送测速请求失败")?;
-    stream.flush().await.context("刷新测速请求失败")?;
+    let (mut sender, conn) = http1::handshake(io).await.ok()?;
 
-    let started = Instant::now();
-    let mut total = 0usize;
-    let mut headers_done = false;
-    let mut header_buf = Vec::with_capacity(8192);
-    let mut buf = [0u8; 16 * 1024];
+    tokio::spawn(async move {
+        let _ = conn.await;
+    });
 
-    loop {
-        let elapsed = started.elapsed();
-        if elapsed >= max_duration {
-            break;
-        }
+    let scheme = if enable_tls { "https" } else { "http" };
+    let uri = format!("{}://{}/cdn-cgi/trace", scheme, crate::runtime::TRACE_HOST);
 
-        let remain = max_duration - elapsed;
-        let n = match timeout(remain, stream.read(&mut buf)).await {
-            Ok(Ok(n)) => n,
-            Ok(Err(err)) => return Err(err).context("读取测速响应失败"),
-            Err(_) => break,
-        };
-        if n == 0 {
-            break;
-        }
+    let request = HyperRequest::builder()
+        .method("GET")
+        .uri(&uri)
+        .header("Host", crate::runtime::TRACE_HOST)
+        .header("User-Agent", "Mozilla/5.0")
+        .header("Accept", "*/*")
+        .header("Accept-Encoding", "identity")
+        .header("Connection", "close")
+        .body(Full::new(Bytes::new()))
+        .ok()?;
 
-        if headers_done {
-            total += n;
-            continue;
-        }
+    let resp = sender.send_request(request).await.ok()?;
 
-        header_buf.extend_from_slice(&buf[..n]);
-        if let Some(pos) = memmem::find(&header_buf, b"\r\n\r\n") {
-            let body_start = pos + 4;
-            if header_buf.len() > body_start {
-                total += header_buf.len() - body_start;
-            }
-            headers_done = true;
-        } else if header_buf.len() > HEADER_BUFFER_LIMIT {
-            return Err(anyhow!("HTTP 响应头过大"));
-        }
-    }
-
-    Ok(total)
-}
-
-fn extract_http_body(response: &[u8]) -> &[u8] {
-    memmem::find(response, b"\r\n\r\n")
-        .map(|pos| &response[pos + 4..])
-        .unwrap_or(response)
+    let body = resp.into_body().collect().await.ok()?;
+    String::from_utf8(body.to_bytes().to_vec()).ok()
 }
 
 fn parse_trace_response<'a>(body: &'a str) -> HashMap<&'a str, &'a str> {

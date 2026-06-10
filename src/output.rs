@@ -41,6 +41,7 @@ pub async fn write_csv(path: &Path, rows: &[ProbeResult], enable_tls: bool, with
                 "RBI",
                 "密钥交换",
                 "时间戳",
+                "备注",
             ])?;
         } else {
             writer.write_record([
@@ -69,6 +70,7 @@ pub async fn write_csv(path: &Path, rows: &[ProbeResult], enable_tls: bool, with
                 "RBI",
                 "密钥交换",
                 "时间戳",
+                "备注",
             ])?;
         }
 
@@ -106,6 +108,7 @@ pub async fn write_csv(path: &Path, rows: &[ProbeResult], enable_tls: bool, with
                 item.rbi,
                 item.kex,
                 item.timestamp,
+                item.name,
             ]);
 
             writer.write_record(record)?;

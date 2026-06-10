@@ -1,4 +1,5 @@
 use std::{
+    collections::HashSet,
     path::{Path, PathBuf},
     sync::Arc,
     time::Duration,
@@ -16,8 +17,6 @@ use tokio_rustls::TlsConnector;
 use crate::model::{IpEntry, Location};
 
 pub const TRACE_HOST: &str = "speed.cloudflare.com";
-#[allow(dead_code)]
-pub const TRACE_PATH: &str = "/cdn-cgi/trace";
 pub const LOCATIONS_URL: &str = "https://locations-adw.pages.dev/";
 pub const ASN_DB_URL: &str = "https://jsd.onmicrosoft.cn/gh/seketiti/GeoLiet2@release/GeoLite2-ASN.mmdb";
 pub const LOCATIONS_FILE: &str = "locations.json";
@@ -25,9 +24,8 @@ pub const LEGACY_LOCATION_FILE: &str = "location.json";
 pub const ASN_DB_FILE: &str = "GeoLite2-ASN.mmdb";
 pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(1);
 pub const TRACE_TIMEOUT: Duration = Duration::from_secs(2);
-pub const SPEED_TIMEOUT: Duration = Duration::from_secs(5);
-pub const TRACE_READ_LIMIT: usize = 32 * 1024;
-pub const HEADER_BUFFER_LIMIT: usize = 64 * 1024;
+pub const SPEED_TIMEOUT: Duration = Duration::from_secs(15);
+pub const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub fn normalize_args<I>(args: I) -> Vec<String>
 where
@@ -176,12 +174,36 @@ pub async fn read_ips(input_path: &Path, pb: &ProgressBar) -> Result<Vec<IpEntry
         .with_context(|| format!("无法从文件中读取 IP: {}", input_path.display()))?;
 
     let mut ips = Vec::new();
+    let mut seen = HashSet::new();
     for line in content.lines() {
         let trimmed = line.trim();
+        // 忽略 # 后的注释内容
+        let (trimmed, name) = match trimmed.split_once('#') {
+            Some((t, n)) => (t.trim(), n.trim().to_string()),
+            None => (trimmed, String::new()),
+        };
         if trimmed.is_empty() {
             continue;
         }
 
+        // 优先尝试 ip:port 格式 (rsplit_once 按最后一个:分割，兼容 IPv6)
+        let entry = if let Some((ip, port_str)) = trimmed.rsplit_once(':') {
+            let ip = ip.trim().to_string();
+            let port = match port_str.trim().parse::<u16>() {
+                Ok(port) => port,
+                Err(_) => {
+                    pb.println(format!("{} 端口格式错误: {}", "[跳过]".yellow().bold(), trimmed));
+                    continue;
+                }
+            };
+            if ip.is_empty() {
+                pb.println(format!("{} 行格式错误: {}", "[跳过]".yellow().bold(), trimmed));
+                continue;
+            }
+            IpEntry { ip, port, name: name.clone() }
+        } else {
+
+        // 原有 ip port 格式
         let parts = trimmed.split_whitespace().collect::<Vec<_>>();
         if parts.len() != 2 {
             pb.println(format!("{} 行格式错误: {}", "[跳过]".yellow().bold(), trimmed));
@@ -197,7 +219,14 @@ pub async fn read_ips(input_path: &Path, pb: &ProgressBar) -> Result<Vec<IpEntry
             }
         };
 
-        ips.push(IpEntry { ip, port });
+            IpEntry { ip, port, name: name.clone() }
+        };
+
+        if !seen.insert(entry.clone()) {
+            pb.println(format!("{} 重复: {}:{}", "[跳过]".yellow().bold(), entry.ip, entry.port));
+            continue;
+        }
+        ips.push(entry);
     }
 
     Ok(ips)
